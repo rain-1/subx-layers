@@ -446,6 +446,9 @@ int main(int argc, char* argv[]) {
   init_help();
   atexit(cleanup_main);
   init_op_names();
+  // Begin Transforms
+  // End Transforms
+
   // End One-time Setup
 
   // Commandline Parsing
@@ -5511,4 +5514,5 @@ uint32_t num_words(const segment& s) {
     sum += SIZE(s.lines.at(i).words);
   return sum;
 }
+
 
