@@ -49,10 +49,148 @@ using std::max;
 
 #include <stdlib.h>
 
+// No brackets around the expansion so that it prints nothing if Trace_stream
+// isn't initialized.
+#define trace(...)  !Trace_stream ? cerr : Trace_stream->stream(__VA_ARGS__)
+
+#define START_TRACING_UNTIL_END_OF_SCOPE  lease_tracer leased_tracer;
+#define raise  (!Trace_stream ? (++Trace_errors,cerr) /*do print*/ : Trace_stream->stream(Error_depth, "error"))
+#define warn (!Trace_stream ? (++Trace_errors,cerr) /*do print*/ : Trace_stream->stream(Warn_depth, "warn"))
+
+// If we aren't yet sure how to deal with some corner case, use assert_for_now
+// to indicate that it isn't an inviolable invariant.
+#define assert_for_now assert
+#define raise_for_now raise
+
+
+#define CHECK_TRACE_CONTENTS(...)  check_trace_contents(__FUNCTION__, __FILE__, __LINE__, __VA_ARGS__)
+
+#define CHECK_TRACE_DOESNT_CONTAIN(...)  CHECK(trace_doesnt_contain(__VA_ARGS__))
+
+#define CHECK_TRACE_COUNT(label, count) \
+  if (Passed && trace_count(label) != (count)) { \
+    cerr << "\nF - " << __FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << "): trace_count of " << label << " should be " << count << '\n'; \
+    cerr << "  got " << trace_count(label) << '\n';  /* multiple eval */ \
+    DUMP(label); \
+    Passed = false; \
+    return;  /* Currently we stop at the very first failure. */ \
+  }
+
+#define CHECK_TRACE_CONTAINS_ERRORS()  CHECK(trace_contains_errors())
+#define CHECK_TRACE_DOESNT_CONTAIN_ERRORS() \
+  if (Passed && trace_contains_errors()) { \
+    cerr << "\nF - " << __FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << "): unexpected errors\n"; \
+    DUMP("error"); \
+    Passed = false; \
+    return; \
+  }
+
+// Allow tests to ignore trace lines generated during setup.
+#define CLEAR_TRACE  delete Trace_stream, Trace_stream = new trace_stream
+
+// To debug why a test is failing, dump its trace using '?'.
+#define DUMP(label)  if (Trace_stream) cerr << Trace_stream->readable_contents(label);
+
+// To add temporary prints to the trace, use 'dbg'.
+// `git log` should never show any calls to 'dbg'.
+#define dbg trace(0, "a")
+
+
+#include <vector>
+using std::vector;
+#include <list>
+using std::list;
+#include <set>
+using std::set;
+
+#include <sstream>
+using std::istringstream;
+using std::ostringstream;
+
+#include <fstream>
+using std::ifstream;
+using std::ofstream;
+
 // End Includes
 
 // Types
 typedef void (*test_fn)(void);
+const int Max_depth = 9999;
+struct trace_line {
+  string contents;
+  string label;
+  int depth;  // 0 is 'sea level'; positive integers are progressively 'deeper' and lower level
+  trace_line(string c, string l) {
+    contents = c;
+    label = l;
+    depth = 0;
+  }
+  trace_line(string c, string l, int d) {
+    contents = c;
+    label = l;
+    depth = d;
+  }
+};
+
+const int Error_depth = 0;
+const int Warn_depth = 1;
+struct trace_stream {
+  vector<trace_line> past_lines;
+  // accumulator for current trace_line
+  ostringstream* curr_stream;
+  string curr_label;
+  int curr_depth;
+  // other stuff
+  int collect_depth;  // avoid tracing lower levels for speed
+  ofstream null_stream;  // never opened, so writes to it silently fail
+
+  // End trace_stream Fields
+
+  trace_stream() {
+    curr_stream = NULL;
+    curr_depth = Max_depth;
+    collect_depth = Max_depth;
+
+    // End trace_stream Constructor
+  }
+  ~trace_stream() {
+    // End trace_stream Destructor
+  }
+  ostream& stream(string label) {
+    return stream(Max_depth, label);
+  }
+
+  ostream& stream(int depth, string label) {
+    if (depth > collect_depth) return null_stream;
+    curr_stream = new ostringstream;
+    curr_label = label;
+    curr_depth = depth;
+    (*curr_stream) << std::hex;  // printing addresses is the common case
+    return *curr_stream;
+  }
+
+  void newline();
+  bool should_incrementally_print_trace();
+
+  string readable_contents(string label) {
+    string trim(const string& s);  // prototype
+    ostringstream output;
+    label = trim(label);
+    for (vector<trace_line>::iterator p = past_lines.begin();  p != past_lines.end();  ++p)
+      if (label.empty() || label == p->label)
+        output << std::setw(4) << p->depth << ' ' << p->label << ": " << p->contents << '\n';
+    return output.str();
+  }
+
+  // End trace_stream Methods
+};
+
+
+struct end {};
+struct lease_tracer {
+  lease_tracer();
+  ~lease_tracer();
+};
 // End Types
 
 // Function prototypes are auto-generated in the 'build' script; define your
@@ -115,6 +253,16 @@ map<string, string> Help;
 bool Run_tests = false;
 bool Passed = true;  // set this to false inside any test to indicate failure
 
+trace_stream* Trace_stream = NULL;
+
+int Hide_errors = false;  // if set, don't print errors or warnings to screen
+int Hide_warnings = false;  // if set, don't print warnings to screen
+int Trace_errors = 0;  // used only when Trace_stream is NULL
+
+// Fail tests that displayed (unexpected) errors.
+// Expected errors should always be hidden and silently checked for.
+ofstream Trace_file;
+bool Dump_trace = false;
 // End Globals
 
 int main(int argc, char* argv[]) {
@@ -135,6 +283,7 @@ int main(int argc, char* argv[]) {
   assert_little_endian();
 
   init_help();
+  atexit(cleanup_main);
   // End One-time Setup
 
   // Commandline Parsing
@@ -148,6 +297,16 @@ int main(int argc, char* argv[]) {
   while (argc > 1 && starts_with(*arg, "--")) {
     if (false)
       ;  // no-op branch just so any further additions can consistently always start with 'else'
+    else if (is_equal(*arg, "--trace")) {
+      cerr << "saving trace to 'last_run'\n";
+      Trace_file.open("last_run");
+      // Add a dummy line up top; otherwise the `browse_trace` tool currently has
+      // no way to expand any lines above an error.
+      Trace_file << "   0 dummy: start\n";
+    }
+    else if (is_equal(*arg, "--dump")) {
+      Dump_trace = true;
+    }
     // End Commandline Options(*arg)
     else
       cerr << "skipping unknown option " << *arg << '\n';
@@ -230,6 +389,8 @@ int main(int argc, char* argv[]) {
 void reset() {
   Passed = true;
 
+  Hide_errors = false;
+  Hide_warnings = false;
   // End Reset
 }
 
@@ -349,8 +510,198 @@ void run_test(size_t i) {
     return;
   }
   reset();
+  START_TRACING_UNTIL_END_OF_SCOPE
+
+  Hide_warnings = true;
   // End Test Setup
   (*Tests[i])();
+  if (Passed && !Hide_errors && trace_contains_errors()) {
+    Passed = false;
+  }
   // End Test Teardown
+}
+
+
+
+ostream& operator<<(ostream& os, end /*unused*/) {
+  if (Trace_stream) Trace_stream->newline();
+  return os;
+}
+
+void trace_stream::newline() {
+  if (!curr_stream) return;
+  string curr_contents = curr_stream->str();
+  if (!curr_contents.empty()) {
+    past_lines.push_back(trace_line(curr_contents, trim(curr_label), curr_depth));  // preserve indent in contents
+    // maybe incrementally dump trace
+    trace_line& t = past_lines.back();
+    if (should_incrementally_print_trace()) {
+      cerr       << std::setw(4) << t.depth << ' ' << t.label << ": " << t.contents << '\n';
+    }
+    if (Trace_file) {
+      Trace_file << std::setw(4) << t.depth << ' ' << t.label << ": " << t.contents << '\n';
+    }
+    // End trace Commit
+  }
+
+  // clean up
+  delete curr_stream;
+  curr_stream = NULL;
+  curr_label.clear();
+  curr_depth = Max_depth;
+}
+
+
+lease_tracer::lease_tracer() { Trace_stream = new trace_stream; }
+lease_tracer::~lease_tracer() {
+  delete Trace_stream;
+  Trace_stream = NULL;
+}
+
+
+bool trace_stream::should_incrementally_print_trace() {
+  if (!Hide_errors && curr_depth == Error_depth) return true;
+  if (!Hide_warnings && !Hide_errors && curr_depth == Warn_depth) return true;
+  if (Dump_trace) return true;
+
+
+  // End Incremental Trace Print Conditions
+  return false;
+}
+bool trace_contains_errors() {
+  return Trace_errors > 0 || trace_count("error") > 0;
+}
+
+bool check_trace_contents(string FUNCTION, string FILE, int LINE, string expected) {
+  if (!Passed) return false;
+  if (!Trace_stream) return false;
+  vector<string> expected_lines = split(expected, "\n");
+  int curr_expected_line = 0;
+  while (curr_expected_line < SIZE(expected_lines) && expected_lines.at(curr_expected_line).empty())
+    ++curr_expected_line;
+  if (curr_expected_line == SIZE(expected_lines)) return true;
+  string label, contents;
+  split_label_contents(expected_lines.at(curr_expected_line), &label, &contents);
+  for (vector<trace_line>::iterator p = Trace_stream->past_lines.begin();  p != Trace_stream->past_lines.end();  ++p) {
+    if (label != p->label) continue;
+    if (contents != trim(p->contents)) continue;
+    ++curr_expected_line;
+    while (curr_expected_line < SIZE(expected_lines) && expected_lines.at(curr_expected_line).empty())
+      ++curr_expected_line;
+    if (curr_expected_line == SIZE(expected_lines)) return true;
+    split_label_contents(expected_lines.at(curr_expected_line), &label, &contents);
+  }
+
+  if (line_exists_anywhere(label, contents)) {
+    cerr << "\nF - " << FUNCTION << "(" << FILE << ":" << LINE << "): line [" << label << ": " << contents << "] out of order in trace:\n";
+    DUMP("");
+  }
+  else {
+    cerr << "\nF - " << FUNCTION << "(" << FILE << ":" << LINE << "): missing [" << contents << "] in trace:\n";
+    DUMP(label);
+  }
+  Passed = false;
+  return false;
+}
+
+bool trace_doesnt_contain(string expected) {
+  vector<string> tmp = split_first(expected, ": ");
+  if (SIZE(tmp) == 1) {
+    raise << expected << ": missing label or contents in trace line\n" << end();
+    assert(false);
+  }
+  return trace_count(tmp.at(0), tmp.at(1)) == 0;
+}
+
+int trace_count(string label) {
+  return trace_count(label, "");
+}
+
+int trace_count(string label, string line) {
+  if (!Trace_stream) return 0;
+  long result = 0;
+  for (vector<trace_line>::iterator p = Trace_stream->past_lines.begin();  p != Trace_stream->past_lines.end();  ++p) {
+    if (label == p->label) {
+      if (line == "" || trim(line) == trim(p->contents))
+        ++result;
+    }
+  }
+  return result;
+}
+
+int trace_count_prefix(string label, string prefix) {
+  if (!Trace_stream) return 0;
+  long result = 0;
+  for (vector<trace_line>::iterator p = Trace_stream->past_lines.begin();  p != Trace_stream->past_lines.end();  ++p) {
+    if (label == p->label) {
+      if (starts_with(trim(p->contents), trim(prefix)))
+        ++result;
+    }
+  }
+  return result;
+}
+
+void split_label_contents(const string& s, string* label, string* contents) {
+  static const string delim(": ");
+  size_t pos = s.find(delim);
+  if (pos == string::npos) {
+    *label = "";
+    *contents = trim(s);
+  }
+  else {
+    *label = trim(s.substr(0, pos));
+    *contents = trim(s.substr(pos+SIZE(delim)));
+  }
+}
+
+bool line_exists_anywhere(const string& label, const string& contents) {
+  for (vector<trace_line>::iterator p = Trace_stream->past_lines.begin();  p != Trace_stream->past_lines.end();  ++p) {
+    if (label != p->label) continue;
+    if (contents == trim(p->contents)) return true;
+  }
+  return false;
+}
+
+vector<string> split(string s, string delim) {
+  vector<string> result;
+  size_t begin=0, end=s.find(delim);
+  while (true) {
+    if (end == string::npos) {
+      result.push_back(string(s, begin, string::npos));
+      break;
+    }
+    result.push_back(string(s, begin, end-begin));
+    begin = end+SIZE(delim);
+    end = s.find(delim, begin);
+  }
+  return result;
+}
+
+vector<string> split_first(string s, string delim) {
+  vector<string> result;
+  size_t end=s.find(delim);
+  result.push_back(string(s, 0, end));
+  if (end != string::npos)
+    result.push_back(string(s, end+SIZE(delim), string::npos));
+  return result;
+}
+
+
+void cleanup_main() {
+  if (Trace_file) Trace_file.close();
+  // End cleanup_main
+}
+
+string trim(const string& s) {
+  string::const_iterator first = s.begin();
+  while (first != s.end() && isspace(*first))
+    ++first;
+  if (first == s.end()) return "";
+
+  string::const_iterator last = --s.end();
+  while (last != s.begin() && isspace(*last))
+    --last;
+  ++last;
+  return string(first, last);
 }
 
