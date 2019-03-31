@@ -7272,6 +7272,7 @@ void test_global_variable() {
 
 void rewrite_global_variables(program& p) {
   trace(3, "transform") << "-- rewrite global variables" << end();
+  insert_heap_global_variable(p);
   // Begin rewrite_global_variables
   map<string, uint32_t> address;
   compute_addresses_for_global_variables(p, address);
@@ -7534,5 +7535,28 @@ string to_full_string(const line& in) {
       out << '/' << in.words.at(i).metadata.at(j);
   }
   return out.str();
+}
+
+
+void insert_heap_global_variable(program& p) {
+  if (SIZE(p.segments) < 2)
+    return;  // no data segment defined
+  // Start-of-heap:
+  p.segments.at(1).lines.push_back(label("Start-of-heap"));
+}
+
+line label(string s) {
+  line result;
+  result.words.push_back(word());
+  result.words.back().data = (s+":");
+  return result;
+}
+
+line imm32(const string& s) {
+  line result;
+  result.words.push_back(word());
+  result.words.back().data = s;
+  result.words.back().metadata.push_back("imm32");
+  return result;
 }
 
