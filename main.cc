@@ -447,6 +447,9 @@ map<string, uint32_t> Operand_bound;
 map</*name*/string, int> Segment_index;
 bool Currently_parsing_named_segment = false;  // global to permit cross-layer communication
 int Currently_parsing_segment_index = -1;  // global to permit cross-layer communication
+uint32_t Entry_address = 0;
+bool Dump_map = false;  // currently used only by 'subx translate'
+ofstream Map_file;
 // End Globals
 
 int main(int argc, char* argv[]) {
@@ -474,6 +477,7 @@ int main(int argc, char* argv[]) {
   Transform.push_back(pack_operands);
   Transform.push_back(compute_segment_starts);
 
+  Transform.push_back(rewrite_labels);
   // End Level-2 Transforms
 
   // End Transforms
@@ -528,6 +532,10 @@ int main(int argc, char* argv[]) {
     }
     else if (is_equal(*arg, "--dump")) {
       Dump_trace = true;
+    }
+    else if (is_equal(*arg, "--map")) {
+      Dump_map = true;
+      // End --map Settings
     }
     // End Commandline Options(*arg)
     else
@@ -631,6 +639,8 @@ int main(int argc, char* argv[]) {
     START_TRACING_UNTIL_END_OF_SCOPE;
     reset();
     // Begin subx translate
+    if (Dump_map)
+      Map_file.open("map");
     program p;
     string output_filename;
     for (int i = /*skip 'subx translate'*/2;  i < argc;  ++i) {
@@ -673,6 +683,9 @@ int main(int argc, char* argv[]) {
       unlink(output_filename.c_str());
       return 1;
     }
+    if (Dump_map)
+      Map_file.close();
+
     // End subx translate
     return 0;
   }
@@ -726,6 +739,7 @@ void reset() {
   Currently_parsing_named_segment = false;
   Currently_parsing_segment_index = -1;
 
+  Entry_address = 0;
   // End Reset
 }
 
@@ -2688,6 +2702,7 @@ void load(const program& p) {
     if (i == 0) End_of_program = addr;
   }
   EIP = p.segments.at(0).start;
+  if (Entry_address) EIP = Entry_address;
   // End Initialize EIP
 }
 
@@ -5541,6 +5556,8 @@ void write_elf_header(ostream& out, const program& p) {
   // e_entry
   uint32_t e_entry = p.segments.at(0).start;  // convention
   // Override e_entry
+  if (Entry_address) e_entry = Entry_address;
+
   emit(e_entry);
   // e_phoff -- immediately after ELF header
   uint32_t e_phoff = 0x34;
@@ -6047,6 +6064,8 @@ bool looks_like_hex_int(const string& s) {
   if (s.empty()) return false;
   if (s.at(0) == '-' || s.at(0) == '+') return true;
   if (isdigit(s.at(0))) return true;  // includes '0x' prefix
+  if (SIZE(s) == 2) return true;
+
   // End looks_like_hex_int(s) Detectors
   return false;
 }
@@ -6929,9 +6948,309 @@ int size_of(const word& w) {
     return 4;
   else if (has_operand_metadata(w, "disp16"))
     return 2;
+  else if (is_label(w))
+    return 0;
+
   // End size_of(word w) Special-cases
   else
     return 1;
 }
 
+
+
+
+
+void test_entry_label() {
+  run(
+      "== 0x1\n"  // code segment
+      "05 0x0d0c0b0a/imm32\n"
+      "Entry:\n"
+      "05 0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "run: 0x00000006 opcode: 05\n"
+  );
+  CHECK_TRACE_DOESNT_CONTAIN("run: 0x00000001 opcode: 05");
+}
+
+void test_pack_immediate_ignores_single_byte_nondigit_operand() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"  // code segment
+      "b9/copy  a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: packing instruction 'b9/copy a/imm32'\n"
+      // no change (we're just not printing metadata to the trace)
+      "transform: instruction after packing: 'b9 a'\n"
+  );
+}
+
+void test_pack_immediate_ignores_3_hex_digit_operand() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"  // code segment
+      "b9/copy  aaa/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: packing instruction 'b9/copy aaa/imm32'\n"
+      // no change (we're just not printing metadata to the trace)
+      "transform: instruction after packing: 'b9 aaa'\n"
+  );
+}
+
+void test_pack_immediate_ignores_non_hex_operand() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"  // code segment
+      "b9/copy xxx/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: packing instruction 'b9/copy xxx/imm32'\n"
+      // no change (we're just not printing metadata to the trace)
+      "transform: instruction after packing: 'b9 xxx'\n"
+  );
+}
+
+void check_valid_name(const string& s) {
+  if (s.empty()) {
+    raise << "empty name!\n" << end();
+    return;
+  }
+  if (s.at(0) == '-')
+    raise << "'" << s << "' starts with '-', which can be confused with a negative number; use a different name\n" << end();
+  if (s.substr(0, 2) == "0x") {
+    raise << "'" << s << "' looks like a hex number; use a different name\n" << end();
+    return;
+  }
+  if (isdigit(s.at(0)))
+    raise << "'" << s << "' starts with a digit, and so can be confused with a negative number; use a different name.\n" << end();
+  if (SIZE(s) == 2)
+    raise << "'" << s << "' is two characters long which can look like raw hex bytes at a glance; use a different name\n" << end();
+}
+
+
+void test_map_label() {
+  transform(
+      "== 0x1\n"  // code segment
+      "loop:\n"
+      "  05  0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: label 'loop' is at address 1\n"
+  );
+}
+
+void rewrite_labels(program& p) {
+  trace(3, "transform") << "-- rewrite labels" << end();
+  if (p.segments.empty()) return;
+  segment& code = p.segments.at(0);
+  map<string, int32_t> byte_index;  // values are unsigned, but we're going to do subtractions on them so they need to fit in 31 bits
+  compute_byte_indices_for_labels(code, byte_index);
+  if (trace_contains_errors()) return;
+  drop_labels(code);
+  if (trace_contains_errors()) return;
+  replace_labels_with_displacements(code, byte_index);
+  if (contains_key(byte_index, "Entry"))
+    Entry_address = code.start + get(byte_index, "Entry");
+}
+
+void compute_byte_indices_for_labels(const segment& code, map<string, int32_t>& byte_index) {
+  int current_byte = 0;
+  for (int i = 0;  i < SIZE(code.lines);  ++i) {
+    const line& inst = code.lines.at(i);
+    for (int j = 0;  j < SIZE(inst.words);  ++j) {
+      const word& curr = inst.words.at(j);
+      // hack: if we have any operand metadata left after previous transforms,
+      // deduce its size
+      // Maybe we should just move this transform to before instruction
+      // packing, and deduce the size of *all* operands. But then we'll also
+      // have to deal with bitfields.
+      if (has_operand_metadata(curr, "disp32") || has_operand_metadata(curr, "imm32")) {
+        if (*curr.data.rbegin() == ':')
+          raise << "'" << to_string(inst) << "': don't use ':' when jumping to labels\n" << end();
+        current_byte += 4;
+      }
+      else if (has_operand_metadata(curr, "disp16")) {
+        if (*curr.data.rbegin() == ':')
+          raise << "'" << to_string(inst) << "': don't use ':' when jumping to labels\n" << end();
+        current_byte += 2;
+      }
+      // automatically handle /disp8 and /imm8 here
+      else if (*curr.data.rbegin() != ':') {
+        ++current_byte;
+      }
+      else {
+        string label = drop_last(curr.data);
+        // ensure labels look sufficiently different from raw hex
+        check_valid_name(label);
+        if (trace_contains_errors()) return;
+        if (contains_any_operand_metadata(curr))
+          raise << "'" << to_string(inst) << "': label definition (':') not allowed in operand\n" << end();
+        if (j > 0)
+          raise << "'" << to_string(inst) << "': labels can only be the first word in a line.\n" << end();
+        if (Map_file.is_open())
+          Map_file << "0x" << HEXWORD << (code.start + current_byte) << ' ' << label << '\n';
+        if (contains_key(byte_index, label) && label != "Entry") {
+          raise << "duplicate label '" << label << "'\n" << end();
+          return;
+        }
+        put(byte_index, label, current_byte);
+        trace(99, "transform") << "label '" << label << "' is at address " << (current_byte+code.start) << end();
+        // no modifying current_byte; label definitions won't be in the final binary
+      }
+    }
+  }
+}
+
+void drop_labels(segment& code) {
+  for (int i = 0;  i < SIZE(code.lines);  ++i) {
+    line& inst = code.lines.at(i);
+    vector<word>::iterator new_end = remove_if(inst.words.begin(), inst.words.end(), is_label);
+    inst.words.erase(new_end, inst.words.end());
+  }
+}
+
+bool is_label(const word& w) {
+  return *w.data.rbegin() == ':';
+}
+
+void replace_labels_with_displacements(segment& code, const map<string, int32_t>& byte_index) {
+  int32_t byte_index_next_instruction_starts_at = 0;
+  for (int i = 0;  i < SIZE(code.lines);  ++i) {
+    line& inst = code.lines.at(i);
+    byte_index_next_instruction_starts_at += num_bytes(inst);
+    line new_inst;
+    for (int j = 0;  j < SIZE(inst.words);  ++j) {
+      const word& curr = inst.words.at(j);
+      if (contains_key(byte_index, curr.data)) {
+        int32_t displacement = static_cast<int32_t>(get(byte_index, curr.data)) - byte_index_next_instruction_starts_at;
+        if (has_operand_metadata(curr, "disp8")) {
+          if (displacement > 0x7f || displacement < -0x7f)
+            raise << "'" << to_string(inst) << "': label too far away for displacement " << std::hex << displacement << " to fit in 8 signed bits\n" << end();
+          else
+            emit_hex_bytes(new_inst, displacement, 1);
+        }
+        else if (has_operand_metadata(curr, "disp16")) {
+          if (displacement > 0x7fff || displacement < -0x7fff)
+            raise << "'" << to_string(inst) << "': label too far away for displacement " << std::hex << displacement << " to fit in 16 signed bits\n" << end();
+          else
+            emit_hex_bytes(new_inst, displacement, 2);
+        }
+        else if (has_operand_metadata(curr, "disp32")) {
+          emit_hex_bytes(new_inst, displacement, 4);
+        }
+      }
+      else {
+        new_inst.words.push_back(curr);
+      }
+    }
+    inst.words.swap(new_inst.words);
+    trace(99, "transform") << "instruction after transform: '" << data_to_string(inst) << "'" << end();
+  }
+}
+
+string data_to_string(const line& inst) {
+  ostringstream out;
+  for (int i = 0;  i < SIZE(inst.words);  ++i) {
+    if (i > 0) out << ' ';
+    out << inst.words.at(i).data;
+  }
+  return out.str();
+}
+
+string drop_last(const string& s) {
+  return string(s.begin(), --s.end());
+}
+
+
+void test_multiple_labels_at() {
+  transform(
+      "== 0x1\n"  // code segment
+      // address 1
+      "loop:\n"
+      " $loop2:\n"
+      // address 1 (labels take up no space)
+      "    05  0x0d0c0b0a/imm32\n"
+      // address 6
+      "    eb  $loop2/disp8\n"
+      // address 8
+      "    eb  $loop3/disp8\n"
+      // address 0xa
+      " $loop3:\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: label 'loop' is at address 1\n"
+      "transform: label '$loop2' is at address 1\n"
+      "transform: label '$loop3' is at address a\n"
+      // first jump is to -7
+      "transform: instruction after transform: 'eb f9'\n"
+      // second jump is to 0 (fall through)
+      "transform: instruction after transform: 'eb 00'\n"
+  );
+}
+
+void test_duplicate_label() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"
+      "loop:\n"
+      "loop:\n"
+      "    05  0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "error: duplicate label 'loop'\n"
+  );
+}
+
+void test_label_too_short() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"
+      "xz:\n"
+      "  05  0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "error: 'xz' is two characters long which can look like raw hex bytes at a glance; use a different name\n"
+  );
+}
+
+void test_label_hex() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"
+      "0xab:\n"
+      "  05  0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "error: '0xab' looks like a hex number; use a different name\n"
+  );
+}
+
+void test_label_negative_hex() {
+  Hide_errors = true;
+  transform(
+      "== 0x1\n"
+      "-a:\n"
+      "    05  0x0d0c0b0a/imm32\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "error: '-a' starts with '-', which can be confused with a negative number; use a different name\n"
+  );
+}
+
+
+void test_segment_size_ignores_labels() {
+  transform(
+      "== code\n"  // 0x09000074
+      "  05/add  0x0d0c0b0a/imm32\n"  // 5 bytes
+      "foo:\n"                        // 0 bytes
+      "== data\n"  // 0x0a000079
+      "bar:\n"
+      "  00\n"
+  );
+  CHECK_TRACE_CONTENTS(
+      "transform: segment 1 begins at address 0x0a000079\n"
+  );
+}
 
