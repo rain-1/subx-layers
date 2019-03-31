@@ -32,9 +32,27 @@ using std::string;
 using std::min;
 using std::max;
 
+#define CHECK(X) \
+  if (Passed && !(X)) { \
+    cerr << "\nF - " << __FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << "): " << #X << '\n'; \
+    Passed = false; \
+    return;  /* Currently we stop at the very first failure. */ \
+  }
+
+#define CHECK_EQ(X, Y) \
+  if (Passed && (X) != (Y)) { \
+    cerr << "\nF - " << __FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << "): " << #X << " == " << #Y << '\n'; \
+    cerr << "  got " << (X) << '\n';  /* BEWARE: multiple eval */ \
+    Passed = false; \
+    return;  /* Currently we stop at the very first failure. */ \
+  }
+
+#include <stdlib.h>
+
 // End Includes
 
 // Types
+typedef void (*test_fn)(void);
 // End Types
 
 // Function prototypes are auto-generated in the 'build' script; define your
@@ -76,6 +94,15 @@ template<typename T> typename T::mapped_type const& put_new(T& map, typename T::
   return map[key];
 }
 
+// move a global ahead into types that we can't generate an extern declaration for
+const test_fn Tests[] = {
+  #include "test_list"  // auto-generated; see 'build*' scripts
+};
+
+// Names for each element of the 'Tests' global, respectively.
+const string Test_names[] = {
+  #include "test_name_list"  // auto-generated; see 'build*' scripts
+};
 // Globals
 //
 // All statements in this section should always define a single variable on a
@@ -85,6 +112,9 @@ template<typename T> typename T::mapped_type const& put_new(T& map, typename T::
 // linkage by default.
 //
 map<string, string> Help;
+bool Run_tests = false;
+bool Passed = true;  // set this to false inside any test to indicate failure
+
 // End Globals
 
 int main(int argc, char* argv[]) {
@@ -144,9 +174,52 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  if (argc > 1 && is_equal(argv[1], "test")) {
+    Run_tests = true;  --argc;  ++argv;  // shift 'test' out of commandline args
+  }
+
   // End Commandline Parsing
 
+  if (Run_tests) {
+    // Test Runs
+    string maybe_single_test_to_run = argv[argc-1];
+    if (!starts_with(maybe_single_test_to_run, "test_"))
+      maybe_single_test_to_run.insert(0, "test_");
+    for (size_t i=0;  i < sizeof(Tests)/sizeof(Tests[0]);  ++i) {
+      if (Test_names[i] == maybe_single_test_to_run) {
+        run_test(i);
+        if (Passed) cerr << ".\n";
+        return 0;
+      }
+    }
+
+    // we run some tests and then exit; assume no state need be maintained afterward
+
+    long num_failures = 0;
+    // End Test Run Initialization
+    time_t t;  time(&t);
+    cerr << "C tests: " << ctime(&t);
+    for (size_t i=0;  i < sizeof(Tests)/sizeof(Tests[0]);  ++i) {
+  //?     cerr << "running " << Test_names[i] << '\n';
+      run_test(i);
+      if (Passed) cerr << '.';
+      else ++num_failures;
+    }
+    cerr << '\n';
+    // End Tests
+    if (num_failures > 0) {
+      cerr << num_failures << " failure"
+           << (num_failures > 1 ? "s" : "")
+           << '\n';
+      return 1;
+    }
+    return 0;
+  }
+
   // End Main
+  cerr << "nothing to do\n";
+  return 1;
+
 
   return 0;
 }
@@ -155,6 +228,8 @@ int main(int argc, char* argv[]) {
 // End Unit Tests
 
 void reset() {
+  Passed = true;
+
   // End Reset
 }
 
@@ -265,5 +340,17 @@ int feenableexcept(unsigned int excepts) {
 
 bool has_data(istream& in) {
   return in && !in.eof();
+}
+
+
+void run_test(size_t i) {
+  if (i >= sizeof(Tests)/sizeof(Tests[0])) {
+    cerr << "no test " << i << '\n';
+    return;
+  }
+  reset();
+  // End Test Setup
+  (*Tests[i])();
+  // End Test Teardown
 }
 
