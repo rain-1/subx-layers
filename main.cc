@@ -1517,6 +1517,16 @@ void run_one_instruction() {
       }
 
 
+      case 2: {  // call function pointer at r/m32
+        trace(Callstack_depth+1, "run") << "call to r/m32" << end();
+        const int32_t* offset = effective_address(modrm);
+        push(EIP);
+        EIP += *offset;
+        trace(Callstack_depth+1, "run") << "jumping to 0x" << HEXWORD << EIP << end();
+        ++Callstack_depth;
+        break;
+      }
+
       // End Op ff Subops
     }
     break;
@@ -1942,6 +1952,26 @@ void run_one_instruction() {
   }
 
 
+  case 0xe8: {  // call disp32 relative to next EIP
+    const int32_t offset = next32();
+    ++Callstack_depth;
+    trace(Callstack_depth+1, "run") << "call imm32 0x" << HEXWORD << offset << end();
+  //?   cerr << "push: EIP: " << EIP << " => " << Reg[ESP].u << '\n';
+    push(EIP);
+    EIP += offset;
+    trace(Callstack_depth+1, "run") << "jumping to 0x" << HEXWORD << EIP << end();
+    break;
+  }
+
+
+  case 0xc3: {  // return from a call
+    trace(Callstack_depth+1, "run") << "return" << end();
+    --Callstack_depth;
+    EIP = pop();
+    trace(Callstack_depth+1, "run") << "jumping to 0x" << HEXWORD << EIP << end();
+    break;
+  }
+
   // End Single-Byte Opcodes
   case 0x0f:
     switch(op2 = next()) {
@@ -2217,6 +2247,10 @@ void init_op_names() {
   put_new(Name_0f, "8c", "jump disp32 bytes away if lesser, if SF != OF (jcc/jl/jnge)");
 
   put_new(Name_0f, "8e", "jump disp32 bytes away if lesser or equal, if ZF is set or SF != OF (jcc/jle/jng)");
+
+  put_new(Name, "e8", "call disp32 (call)");
+
+  put_new(Name, "c3", "return from most recent unfinished call (ret)");
 
   // End Initialize Op Names
 }
@@ -4948,5 +4982,77 @@ void test_jle_disp32_greater() {
       "run: 0x0000000c opcode: 05\n"
   );
   CHECK_TRACE_DOESNT_CONTAIN("run: jump 5");
+}
+
+
+void test_call_disp32() {
+  Reg[ESP].u = 0x64;
+  run(
+      "== 0x1\n"  // code segment
+      // op     ModR/M  SIB   displacement  immediate
+      "  e8                                 a0 00 00 00 \n"  // call function offset at 0x000000a0
+      // next EIP is 6
+  );
+  CHECK_TRACE_CONTENTS(
+      "run: call imm32 0x000000a0\n"
+      "run: decrementing ESP to 0x00000060\n"
+      "run: pushing value 0x00000006\n"
+      "run: jumping to 0x000000a6\n"
+  );
+}
+
+void test_call_r32() {
+  Reg[ESP].u = 0x64;
+  Reg[EBX].u = 0x000000a0;
+  run(
+      "== 0x1\n"  // code segment
+      // op     ModR/M  SIB   displacement  immediate
+      "  ff     d3                                      \n"  // call function offset at EBX
+      // next EIP is 3
+  );
+  CHECK_TRACE_CONTENTS(
+      "run: call to r/m32\n"
+      "run: r/m32 is EBX\n"
+      "run: decrementing ESP to 0x00000060\n"
+      "run: pushing value 0x00000003\n"
+      "run: jumping to 0x000000a3\n"
+  );
+}
+
+void test_call_mem_at_r32() {
+  Reg[ESP].u = 0x64;
+  Reg[EBX].u = 0x2000;
+  run(
+      "== 0x1\n"  // code segment
+      // op     ModR/M  SIB   displacement  immediate
+      "  ff     13                                      \n"  // call function offset at *EBX
+      // next EIP is 3
+      "== 0x2000\n"  // data segment
+      "a0 00 00 00\n"  // 0x000000a0
+  );
+  CHECK_TRACE_CONTENTS(
+      "run: call to r/m32\n"
+      "run: effective address is 0x00002000 (EBX)\n"
+      "run: decrementing ESP to 0x00000060\n"
+      "run: pushing value 0x00000003\n"
+      "run: jumping to 0x000000a3\n"
+  );
+}
+
+
+void test_ret() {
+  Reg[ESP].u = 0x2000;
+  run(
+      "== 0x1\n"  // code segment
+      // op     ModR/M  SIB   displacement  immediate
+      "  c3                                           \n"  // return
+      "== 0x2000\n"  // data segment
+      "10 00 00 00\n"  // 0x00000010
+  );
+  CHECK_TRACE_CONTENTS(
+      "run: return\n"
+      "run: popping value 0x00000010\n"
+      "run: jumping to 0x00000010\n"
+  );
 }
 
