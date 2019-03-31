@@ -451,6 +451,9 @@ uint32_t Entry_address = 0;
 bool Dump_map = false;  // currently used only by 'subx translate'
 ofstream Map_file;
 int Next_auto_global = 1;
+map</*address*/uint32_t, string> Symbol_name;  // used only by 'subx run'
+map<string, uint32_t> Watch_points;
+string Watch_this_effective_address;
 // End Globals
 
 int main(int argc, char* argv[]) {
@@ -542,6 +545,7 @@ int main(int argc, char* argv[]) {
     }
     else if (is_equal(*arg, "--map")) {
       Dump_map = true;
+      load_map("map");
       // End --map Settings
     }
     // End Commandline Options(*arg)
@@ -747,6 +751,7 @@ void reset() {
   Currently_parsing_segment_index = -1;
 
   Entry_address = 0;
+  Watch_points.clear();
   // End Reset
 }
 
@@ -1403,6 +1408,13 @@ inline bool already_allocated(uint32_t addr) {
 void run_one_instruction() {
   uint8_t op=0, op2=0, op3=0;
   // Run One Instruction
+  Watch_this_effective_address = "";
+  if (contains_key(Symbol_name, EIP) && starts_with(get(Symbol_name, EIP), "$watch-"))
+    Watch_this_effective_address = get(Symbol_name, EIP);
+  dump_watch_points();
+  if (contains_key(Symbol_name, EIP))
+    trace(Callstack_depth, "run") << "== label " << get(Symbol_name, EIP) << end();
+
   if (Trace_file) {
     dump_registers();
     //? dump_stack();  // slow
@@ -2326,6 +2338,13 @@ void dump_registers() {
 // debugging info from a later layer
 string call_label(uint8_t op) {
   if (op != 0xe8) return "";
+  // at this point we've skipped past the e8 opcode, but not the offset operand
+  int32_t offset = read_mem_i32(EIP);
+  uint32_t next_eip = EIP+offset+4;
+  if (contains_key(Symbol_name, next_eip))
+    return "/call "+get(Symbol_name, next_eip);
+
+
   // End Trace Call Instruction
   return "/call";
 }
@@ -3077,6 +3096,11 @@ uint32_t effective_address_number(uint8_t modrm) {
     exit(1);
   }
   // Found effective_address(addr)
+  if (!Watch_this_effective_address.empty()) {
+    dbg << "now watching " << HEXWORD << addr << " for " << Watch_this_effective_address << end();
+    put(Watch_points, Watch_this_effective_address, addr);
+  }
+
   return addr;
 }
 
@@ -7832,5 +7856,26 @@ void test_parse2_string_containing_slashes() {
   CHECK_TRACE_CONTENTS(
       "parse2: word: \"bc/def\" /disp32\n"
   );
+}
+
+
+
+void load_map(const string& map_filename) {
+  ifstream fin(map_filename.c_str());
+  fin >> std::hex;
+  while (has_data(fin)) {
+    uint32_t addr = 0;
+    fin >> addr;
+    string name;
+    fin >> name;
+    put(Symbol_name, addr, name);
+  }
+}
+
+void dump_watch_points() {
+  if (Watch_points.empty()) return;
+  dbg << "watch points:" << end();
+  for (map<string, uint32_t>::iterator p = Watch_points.begin();  p != Watch_points.end();  ++p)
+    dbg << "  " << p->first << ": " << HEXWORD << p->second << " -> " << HEXWORD << read_mem_u32(p->second) << end();
 }
 
